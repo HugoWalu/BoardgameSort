@@ -17,8 +17,8 @@ ranked-choice voting on the night's plan, and (later) play history that makes th
 | Poll options | **Plans**, not games. A single-game poll is a 1-slot plan. |
 | Planner output | 2–3 preset shapes, user ranks the candidate plans |
 | Campaign/legacy | Not in scope. Revisit later. |
-| Stack | Next.js + TypeScript + Tailwind + Postgres. Details in §10. |
-| Hosting | Vercel Hobby + Supabase free Postgres. Free `*.vercel.app` subdomain for now. Details in §10.1. |
+| Stack | Go (`net/http` + `html/template`) + htmx + Tailwind + Postgres. Details in §10. |
+| Hosting | Google Cloud Run (scale-to-zero) + Supabase free Postgres. Free `*.run.app` subdomain for now. Details in §10.1. |
 
 ### Product thesis
 
@@ -33,7 +33,7 @@ Every step in that loop must take under ~10 seconds. If voting requires a signup
 
 - Public signup, discovery, or social features
 - Buying recommendations (M3 at the earliest, and only as gap analysis)
-- Websockets / true realtime (3s polling is invisible to users)
+- Websockets / true realtime (3s fragment polling is invisible to users)
 - Desktop-first table UI
 - Batch BGG library sync in M1
 - Native apps
@@ -452,6 +452,11 @@ toward "4 of 6 ballots in" — nobody sees a half-finished ballot.
 
 A submitted ballot stays editable until close, so undo is scoped to the editor, not the record.
 
+**Implementation**: server-rendered fragments (htmx) carry the rank, unrank, reorder, veto and
+submit round-trips. The "Your order" strip and its undo stack are the one piece of hand-written
+JavaScript (~100 lines); everything else is HTML. Because every change persists server-side,
+a refresh or a dropped connection loses nothing.
+
 ### 4.9 Reveal
 
 Round-by-round bars, eliminations in red, transfer arrows, revealed one step at a time.
@@ -474,16 +479,20 @@ slots so the poll history and reveal never mutate.
 
 ## 5. Screens (M1)
 
+All routes are `net/http` handlers using Go 1.22 wildcard patterns
+(`GET /join/{token}`, `r.PathValue("token")`); no router library. This table is the URL
+contract, not a file tree.
+
 | Route | Purpose |
 | --- | --- |
-| `/join/:token` | Invite-link login, sets session cookie/account |
+| `/join/{token}` | Invite-link login, sets session cookie/account |
 | `/` | Shelf: games, owner(s), lend status, last played |
-| `/games/new`, `/games/:id` | Quick add (BGG id autofill), edit, copies, veto toggle |
-| `/g/:group/members` | Names, invite link generation |
+| `/games/new`, `/games/{id}` | Quick add (BGG id autofill), edit, copies, veto toggle |
+| `/g/{group}/members` | Names, invite link generation |
 | `/tonight` | Constraints: headcount, minutes, energy, attendees, exclusions |
 | `/tonight/result` | Scored top 5 with reason chips, "why" expander, "create poll" |
-| `/poll/:id` | Ballot (voter view) or plan tabs + close button (host view) |
-| `/poll/:id/reveal` | IRV rounds, winner, slot diff |
+| `/poll/{id}` | Ballot (voter view) or plan tabs + close button (host view) |
+| `/poll/{id}/reveal` | IRV rounds, winner, slot diff |
 
 M2 adds the planner view (timeline with editable slots) between `/tonight` and `/poll`.
 
@@ -498,7 +507,8 @@ M2 adds the planner view (timeline with editable slots) between `/tonight` and `
 - **No accounts for the vote** is not an option anymore, but the invite link must be one tap.
 - **Participation, not preferences, while open.** Show `4 of 6 ballots in` and who hasn't voted.
 - **Host is the bottle-neck** → default `closes_at` = now + 15 min, host can close early or extend.
-- QR code rendered client-side from the poll URL. No extra service.
+- QR code rendered **server-side** (`skip2/go-qrcode`) from `APP_URL`, so the encoded host can
+  never drift from the link the group was sent.
 
 ---
 
@@ -509,7 +519,9 @@ M2 adds the planner view (timeline with editable slots) between `/tonight` and `
 users(id, name, email_nullable, created_at)
 groups(id, name, created_at)
 memberships(group_id, user_id, role, created_at)
-invites(id, group_id, user_id, token, expires_at, used_at)
+invites(id, group_id, user_id, token_hash, expires_at, used_at)
+auth_sessions(id, user_id, token_hash, created_at, last_seen_at, revoked_at)
+-- device login. `sessions` below is a game night — different table, different meaning.
 
 -- catalogue (BGG cache + manual entries)
 games(
@@ -563,9 +575,13 @@ play_players(play_id, user_id, guest_name, position, score, winner)
 
 Notes:
 
-- `int[]` for player-count sets on Postgres. On SQLite use a join table — arrays break here.
+- `int[]` for player-count sets on Postgres; `pgx` reads and writes them natively (`[]int32`).
+  No join table needed.
 - Indexes: `games(bgg_id)`, `slots(plan_id, position)`, `ballots(poll_id, user_id)`,
-  `copies(game_id)`, `plays(group_id, played_on)`.
+  `copies(game_id)`, `plays(group_id, played_on)`, `auth_sessions(token_hash)`,
+  `invites(token_hash)`.
+- Both token tables store a **sha256 hash** of 32 bytes from `crypto/rand`; the raw value exists
+  only in the link or the cookie.
 - `group_id` on everything from day one: a column now, a migration later.
 - Create `slots`, `plans`, `knows`, `plays.duration_min`, `plays.teach_minutes`,
   `plays.new_players` and `games.teach_override_min` in M1 even though one-slot plans are
@@ -604,10 +620,15 @@ Practical requirements:
 
 ## 9. Auth: invite links, no SMTP
 
-1. Host generates `https://app/join/<token>` per person, valid 14 days, single use.
+1. Host generates `https://app/join/<token>` per person, valid 14 days, single use. Store only
+   the **hash** of the token.
 2. Paste into the group chat. One tap = logged in on that device.
-3. Token is exchanged for a long-lived session cookie.
-4. Same `token` mechanism later supports emailed magic links if ever wanted.
+3. Token is exchanged for a long-lived session cookie: an opaque random token whose hash lives
+   in `auth_sessions`, delivered httpOnly/`Secure`/`SameSite=Lax`, host-only, 90 days.
+4. Reissuing a token revokes the previous session row, so a lost device is killed server-side.
+5. Every state-changing `POST` carries a CSRF token (double-submit cookie, checked in
+   middleware). `SameSite=Lax` is defence in depth, not the mechanism.
+6. The same `token` mechanism later supports emailed magic links if ever wanted.
 
 Fallback if a device is lost: host reissues a token.
 
@@ -615,106 +636,209 @@ Fallback if a device is lost: host reissues a token.
 
 ## 10. Stack
 
-- **Next.js (App Router) + TypeScript + Tailwind + shadcn/ui**
-- **Postgres on Supabase** (free tier) — database only, **not** Supabase Auth
-- **Vercel** for deploy
-- **Custom invite-token auth** + signed httpOnly cookie (see §9). Supabase Auth would add a
+- **Go, standard library first.** `net/http` routing (1.22 method + wildcard patterns) and
+  `html/template` for server-rendered pages. No web framework, no codegen step.
+- **`htmx`** (vendored, ~14KB) for fragment swaps and 3s poll polling. No client framework,
+  no Node, no hydration — plus the ~100 lines of ballot JS described in §4.8.
+- **`pgx/v5`** with hand-written SQL. Queries live next to the handler that uses them; `int[]`
+  and `text[]` scan straight into Go slices. No ORM, no query generator.
+- **Tailwind** via the standalone CLI at image-build time; the output is embedded with
+  `go:embed`, so the binary serves its own CSS and static files.
+- **Postgres on Supabase** (free tier) — database only, **not** Supabase Auth.
+- **Google Cloud Run** for deploy (container, scale-to-zero) — §10.1.
+- **Custom invite-token auth** + opaque session cookie (see §9). Supabase Auth would add a
   parallel identity system that the token flow already replaces.
-- QR generation client-side (`qrcode`)
-- Migrations: Drizzle (or Prisma) with a committed migrations folder, run against the
-  **direct** connection — never from a serverless function
+- QR generated **server-side** (`skip2/go-qrcode`) so the poll URL is never assembled in the
+  browser and can't drift from `APP_URL`.
+- **`goose`** migrations with a committed `migrations/` folder, run against the **direct**
+  connection (5432) — never from an app request.
 
-Fallback for self-hosting later: same app, Postgres in Docker, Better Auth.
-Keep auth and BGG access behind thin interfaces so the swap is contained.
+Dependency budget: `pgx`, `go-qrcode`, htmx, and `testcontainers-go` for tests. Everything else
+is the standard library.
+
+```
+cmd/server/main.go          flags, pool, routes, graceful shutdown
+internal/auth/              invite + session tokens, CSRF, middleware
+internal/db/                pool setup, small query helpers
+internal/games/             shelf, copies, lending, vetoes
+internal/bgg/               adapter interface + XML client
+internal/planner/           pure functions: score, IRV, fillSlots, teach, slowdown
+internal/web/               handlers + templates/*.html + static/
+migrations/                 numbered .sql files, applied by goose
+```
+
+**Deliberately not used** — each of these adds a layer between the code and the behaviour a
+reviewer has to trust:
+
+| Rejected | Why |
+| --- | --- |
+| TypeScript / Next.js | Two languages and a framework for an app that is mostly forms |
+| `templ` | Code generation: generated `_templ.go` files are another thing to audit; plain `.html` is readable by anyone |
+| `chi` | `net/http` has method + wildcard routing since 1.22 |
+| `sqlc` / an ORM | Generated or magic query layers hide the actual SQL; hand-written `pgx` queries are longer but auditable |
+| Django / FastAPI | Django is fastest to build but least inspectable; FastAPI rebuilds auth, CSRF and admin by hand anyway |
+
+Fallback for self-hosting later: the same binary in Docker against any Postgres, optionally
+behind a reverse proxy with TLS. Keep auth and BGG access behind thin interfaces so the swap
+is contained.
 
 ---
 
 ## 10.1 Hosting
 
-Target: **Vercel Hobby** for the app + **Supabase free** Postgres. Zero cost, zero ops.
-Load is trivial — ~50 requests a week plus a burst of 6 devices polling every 3s for
-15 minutes — so no limits are close.
+Target: **Google Cloud Run** for the app + **Supabase free** Postgres. Zero cost at this
+volume, near-zero ops. Load is trivial — ~50 requests a week plus a burst of 6 devices polling
+every 3s for 15 minutes (~1,800 requests a night) — so no limits are close.
 
 | Piece | Choice |
 | --- | --- |
-| App | Vercel Hobby, GitHub repo, auto-deploy `main` |
-| Functions region | Same region as the Supabase project (Hobby allows one). Misalignment adds ~100ms per query. |
-| Database | Supabase free Postgres, **pooled** connection (Supavisor, transaction mode) for the app |
-| Migrations / dumps | **Direct** connection (port 5432) only |
+| App | Cloud Run service built from a `Dockerfile`, scale-to-zero, Cloud Build trigger on `main` |
+| Region | **Same region as the Supabase project.** Misalignment adds ~100ms to every query. |
+| Scaling | `min-instances=0`, `max-instances=2-3`, pgx pool ≤5 per instance |
+| Database | Supabase free Postgres, **pooled** connection (Supavisor, transaction mode) on 6543 |
+| Migrations / dumps | **Direct** connection (port 5432) only, from CI or a laptop |
 | Images | Store BGG URL in M1; move thumbnails to Supabase Storage (1GB free) if hotlinking feels slow |
 | Backups | "Export JSON" button + nightly `pg_dump` GitHub Action against the direct URL |
+| Keepalive | Cloud Scheduler → `/healthz` running `SELECT 1`, once a day (3 jobs free) |
+| Secrets | Secret Manager for `AUTH_SECRET` and `DATABASE_URL` (6 active versions free) |
+| Billing | A billing account is required even at $0; set a **$1 budget alert** |
+
+The server listens on `0.0.0.0:$PORT` (Cloud Run injects `PORT`) and shuts down gracefully on
+`SIGTERM`; Cloud Run health-checks both. A Go cold start is ~1–2s, so the "waking up the shelf"
+loading state a Node/serverless stack would need is not worth building.
+
+### Cost
+
+| Item | Free tier | This app |
+| --- | --- | --- |
+| Cloud Run | 2M requests, 180k vCPU-s, 360k GiB-s per month | far below every limit |
+| Cloud Scheduler | 3 jobs | 1 |
+| Artifact Registry | 0.5 GB | keep the last 5 images |
+| Cloud Build | ~120 min/day | ~2 min per deploy |
+| Supabase | free project | fine |
+
+The only realistic upgrade is `min-instances=1` (~$5/mo) if cold starts ever annoy. Set the
+Artifact Registry cleanup policy on day one so old images don't accumulate silently.
+
+### Rollback
+
+Every deploy creates a revision. Roll back by shifting traffic to the previous revision
+(`gcloud run services update-traffic`), which is faster and safer than a revert-and-rebuild.
 
 ### Environment variables
 
 ```
 DATABASE_URL        pooled, port 6543
-DIRECT_URL          direct, port 5432 — migrations and dumps only
+DIRECT_URL          direct, port 5432 — local/CI only; never set on the Cloud Run service
 AUTH_SECRET         32+ random bytes
-APP_URL             https://<project>.vercel.app   ← single source for every generated link
+APP_URL             https://<service>-<hash>.run.app   ← single source for every generated link
 ```
 
-**Rule: build every join link, poll link and QR code from `APP_URL`, never from
-`request.url`.** This one rule prevents the ugliest bug in this deployment.
+**Rule: build every join link, poll link and QR code from `APP_URL`, never from the request
+host.** This one rule prevents the ugliest bug in this deployment: a link minted on a staging
+host that dies next week.
 
-### Trap 1 — preview URLs leak into QR codes
+### Trap 1 — the transaction pooler rejects prepared statements
 
-Every branch gets a preview deployment. If you open a poll there and hit share, the QR
-encodes `project-git-branch-user.vercel.app`, which may not exist next week — and if
-Deployment Protection is on, friends hit a 401 login wall instead of a ballot.
-
-Mitigation: generate links only from `APP_URL`; test the share flow on production.
-Preview URLs are for the developer, not for the group.
+Supavisor in transaction mode cannot keep a prepared statement alive across connections, and
+`pgx` uses the extended protocol by default. Set `DefaultQueryExecMode = pgx.QueryExecModeExec`
+(or the simple protocol) on the pool config. Without it, queries work in development and fail
+intermittently in production with *"prepared statement does not exist"*.
 
 ### Trap 2 — Supabase pauses after ~7 days idle
 
 A quiet month means the first page load takes ~30 seconds to resume, while six people wait.
-Mitigation: a daily Vercel cron hitting a cheap endpoint that touches the DB (also doubles as
-an uptime check). Hobby cron allows one run per day — exactly enough.
+Mitigation: a daily Cloud Scheduler job hitting a cheap `/healthz` endpoint that runs
+`SELECT 1` (also doubles as an uptime check).
 
-Verify this actually prevents the pause rather than assuming. If it doesn't, ship a
-"waking up the shelf" loading state; survivable, but embarrassing on a game night.
+Verify this actually prevents the pause rather than assuming. If it doesn't, run one minimum
+instance during the season — cheap, and it keeps both the service and the database warm.
 
-### Trap 3 — no long-running work
+### Trap 3 — every instance holds its own connection pool
 
-Hobby cron is daily, functions have a duration cap, and there is no queue. This is why BGG
-is fetched **once, synchronously, on add**, then stored (§8). A "sync my whole BGG
-collection" button is fine; a nightly re-sync of 200 games is not — that wants a VPS or a
+Cloud Run scales horizontally by default, and each instance opens up to its pgx pool size
+against a free-tier Supabase project. Cap `max-instances` at 2–3 and the pool at 5. Six phones
+polling is ~2 req/s; one instance covers the whole night.
+
+### Trap 4 — scale-to-zero means no in-process work
+
+A background goroutine does not survive an instance going cold, and there is no queue. This is
+why BGG is fetched **once, synchronously, on add**, then stored (§8). A "sync my whole BGG
+collection" button is fine; a nightly re-sync of 200 games is not — that wants a worker and a
 paid tier.
 
-### Session cookies on serverless
+### Trap 5 — no per-branch preview deployments
 
-Invite token → httpOnly, `Secure`, `SameSite=Lax` cookie, 90-day expiry, server-side
-revocable (no un-killable JWT). Rotate on reissue. Do **not** set a cookie `Domain` while on
-`*.vercel.app` — leaving it host-only means a future domain move doesn't strand sessions.
+Cloud Run gives you one URL per service, not one per branch. Test locally; if a safety net is
+wanted, run a second service (`staging`) from the same image. Never share links generated there:
+every link comes from `APP_URL`, which always points at production.
+
+### Session cookies
+
+Invite token → opaque random session token, stored **hashed** in `auth_sessions`, delivered
+httpOnly, `Secure`, `SameSite=Lax` with a 90-day expiry. Server-side revocable (no un-killable
+JWT); rotation on reissue revokes the previous row.
+
+Every state-changing `POST` also carries a CSRF token (double-submit cookie, checked in
+middleware). There is no framework doing this for you here — `SameSite=Lax` alone is not
+treated as sufficient.
+
+Do **not** set a cookie `Domain` while on `*.run.app` — leaving it host-only means a future
+domain move doesn't strand sessions.
 
 ### Game-night launch checklist
 
-1. Open the poll on the **production** URL
+1. Open the poll on the **production** `APP_URL`
 2. Confirm the QR resolves to that same host
 3. Vote once from cellular, not wifi — proves the network path
 4. Hit the export button once, before you need it
 
 ### Future domain move
 
-Buy the domain (~€10/yr) when you're ready, then keep the `*.vercel.app` host alive and
-308-redirect it to the new one. Old group-chat links keep working; only `APP_URL` changes,
-and everything generated from it follows automatically.
+Buy the domain (~€10/yr) when you're ready, map it to the Cloud Run service (Cloud Run domain
+mapping, or a small external HTTPS load balancer if the region doesn't support mapping), and
+keep the `*.run.app` host alive with a 308 redirect to the new one. Old group-chat links keep
+working; only `APP_URL` changes, and everything generated from it follows automatically.
 
 ---
 
 ## 11. Testing
 
-- Unit-testable pure functions: `score(games, constraints)`, `irv(ballots, vetoes)`,
-  `fillSlots(budget, preset, shelf)`, `teachTime(game, attendees, plays)`,
-  `slowdown(game, attendees)`. Write those first; they're where bugs live.
-- `teachTime` gets a table test: the weight/length matrix above, one never-played attendee,
+- Unit-testable pure functions in `internal/planner`, taking plain structs and touching no
+  database: `Score(games, constraints)`, `IRV(ballots, vetoes)`,
+  `FillSlots(budget, preset, shelf)`, `TeachTime(game, attendees, plays)`,
+  `Slowdown(game, attendees)`. Write those first; they're where bugs live.
+- Table tests are native Go (`t.Run` over a `[]struct{ name string; in, want ... }`); the
+  matrices in §4.2 become fixture slices rather than hand-written cases.
+- `TeachTime` gets a table test: the weight/length matrix above, one never-played attendee,
   one single-play attendee, 7 months stale, and the override field.
-- `slowdown` gets the worked-example table as an assertion set, plus its +60% cap and the
+- `Slowdown` gets the worked-example table as an assertion set, plus its +60% cap and the
   "measured bucket overrides formula" path.
-- Seed fixtures: 20 games with deliberately messy data (null weight, unknown best-at,
-  one vetoed, one lent out) and run the planner against them.
+- Seed fixtures: `testdata/games.json` with 20 games of deliberately messy data (null weight,
+  unknown best-at, one vetoed, one lent out) and run the planner against them. Handler and
+  query tests run against a throwaway Postgres (`testcontainers-go`), never the production
+  project.
 - The real test is **one actual game night**. Deploy before it, use it, write down every
   moment of friction. That session will change the roadmap more than any planning doc.
+- The ballot's order strip and undo stack get a manual pass on a real phone; that is the only
+  device that matters, and there is no browser test harness to maintain.
+
+### Review contract
+
+The code is written with AI assistance and reviewed by someone who reads Go but won't audit
+every line. These rules are what make review possible:
+
+- **`make check` is the gate**: `gofmt -l .`, `go vet ./...`, `go test ./...`, `go build ./...`.
+  Nothing is "done" until all four are green.
+- **Schema changes arrive only as a new numbered file in `migrations/`.** A diff that changes
+  database shape without a new migration is a bug, full stop.
+- **One file, one job.** A file that no longer fits on a screen is a signal to split it, not to
+  scroll. The layout in §10 is the map.
+- **The hand-checked behaviours** are the ones that ruin a night: an invite link works once and
+  fails the second time; the tally is absent from the payload before close; a ballot survives a
+  refresh; every link and QR code uses `APP_URL`.
+- **`README.md`** lists the commands, **`AGENTS.md`** restates these invariants, so later AI
+  sessions don't drift.
 
 ### Edge cases to cover explicitly
 
@@ -759,12 +883,16 @@ and everything generated from it follows automatically.
 
 **M1**
 
+0. Walking skeleton: Go module, `/healthz`, one empty page, Tailwind built into the binary with
+   `go:embed`, `Dockerfile`, deployed to Cloud Run (§10.1). Proves billing, container, URL and
+   phone access before any feature exists.
 1. Invite auth, group, members
 2. Shelf: quick add + copies + lend/return + vetoes
 3. Tonight: constraints → scored top 5 with reason chips
 4. Poll: create, tap-to-rank with order strip + undo, server-side drafts, participation-only status
 5. Close → IRV reveal with frozen snapshot, auto-close
-6. Deploy: Vercel + Supabase, env vars, daily keepalive cron, export button (§10.1); use on a real game night
+6. Production hardening: Secret Manager, daily keepalive cron, export button, budget alert
+   (§10.1); use on a real game night
 
 **M2**
 
