@@ -1,0 +1,17 @@
+version: "2"
+
+sql:
+  - engine: "postgresql"
+    schema: "internal/database/migrations"
+    queries: "internal/database/queries"
+    gen:
+      go:
+        package: "db"
+        out: "internal/database/db"
+        sql_package: "pgx/v5"
+        emit_pointers_for_null_types: true
+        overrides:
+          - column: "games.weight"
+            go_type:
+              type: "float64"
+              pointer: true

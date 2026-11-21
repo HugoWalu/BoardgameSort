@@ -85,17 +85,22 @@ Every slot estimate is:
 est_minutes    = effective_play + overhead
 effective_play = playing_time * (1 + slowdown)            // §4.2.2
 overhead       = max(teach, setup) + 0.5 * min(teach, setup)   // §4.2.1
-setup          = 3 (base) | 5-10 (expansions, inserts)
+setup          = 3 (base) | 5-10 (expansions, inserts)   // M1/M2: constant 3
 ```
 
 Setup and teach **overlap** — someone sets up while you explain. Charging both in full
-double-counts, hence the `max + half the smaller` rule.
+double-counts, hence the `max + half the smaller` rule. For M1/M2 setup is a flat 3 minutes;
+the 5–10 minute cases need a per-game override (`games.setup_override_min`, M2).
 
 A 6-hour plan that sums BGG `playingtime` overruns by an hour. Always show the breakdown:
 
 ```
-Wingspan  70 play +11 slow (1 new)  +8 teach  +3 setup  = 92 min
+Wingspan  70 play +13 slow (1 new)  +13 overhead (12 teach / 3 setup)  = 96 min
 ```
+
+The `overhead` column is `max(teach, setup) + 0.5 × min(teach, setup)`, not `teach + setup`.
+Components are rounded for display; the planner keeps floats, so a total can differ from the
+rounded sum by a minute.
 
 Breaks are slots, not gaps. A session ≥ 240 min gets a 15-minute break; ≥ 300 min gets
 a 40-minute dinner slot.
@@ -111,8 +116,8 @@ sitting at the table. Three cases:
 | **Refresh** — everyone has played, but it was months ago | A fraction of full teach |
 | **Warm** — everyone played it recently | ~0; render nothing, not "+0 min" |
 
-Never treat "not played in 8 months" as "never played". A refresh is 2–5 minutes; teaching
-Concordia is 17.
+Never treat "not played in 8 months" as "never played". A refresh is a fraction of the full
+teach (0.10–0.40, capped at 3–10 minutes); teaching Concordia from scratch is 17.
 
 **Full teach from weight and length** (weight carries most of the signal; length adds a little
 because long games have more subsystems):
@@ -126,20 +131,21 @@ teach_full = 2 * weight^1.8 * (0.75 + playing_time / 240)
 | Just One | 1.1 | 20 | 2 min |
 | Codenames | 1.3 | 15 | 3 min |
 | Carcassonne | 1.9 | 40 | 6 min |
-| Catan | 2.3 | 60 | 9 min |
-| Wingspan | 2.4 | 60 | 10 min |
+| Catan | 2.3 | 75 | 10 min |
+| Wingspan | 2.4 | 70 | 10 min |
 | Concordia | 3.0 | 100 | 17 min |
-| Brass: Birmingham | 3.9 | 120 | 28 min |
-| Twilight Imperium | 4.3 | 240 | 46 min |
+| Brass: Birmingham | 3.9 | 120 | 29 min |
+| Twilight Imperium | 4.3 | 240 | 48 min |
 
 Display rounded to the minute; keep the float for the maths. Missing weight → assume 2.5 and
 mark the estimate low-confidence.
 
-**Familiarity ladder — the single shared definition**, used by both teach (below) and
-slowdown (§4.2.2). Per person, per game:
+**Novelty ladder — the single shared definition**, used by both teach (below) and
+slowdown (§4.2.2). It measures how much the person still needs to learn: `1.00` is a complete
+newcomer, `0.00` is a recent veteran. Per person, per game:
 
 ```
-familiarity(user, game)
+novelty(user, game)
   0 plays                        → 1.00
   1 play                         → 0.60
   2 plays                        → 0.30
@@ -147,12 +153,12 @@ familiarity(user, game)
   ≥3 plays, played ≥ 180 days    → 0.30   (they'll ask rules questions)
 ```
 
-Teach takes the **minimum** across attendees — the least experienced person sets the floor.
+Teach takes the **maximum** across attendees — the least experienced person sets the floor.
 Slowdown takes the **sum** — every novice at the table contributes. Four veterans plus one
 person who played it once costs 60% of a full teach, not 100% and not zero.
 
 ```
-plays_min = min(familiarity(user, game) for user in attendees)
+teach_factor = max(novelty(user, game) for user in attendees)
 ```
 
 **Refresh from recency**, using the attendee who last played it *longest ago*:
@@ -169,11 +175,13 @@ else       → 0
 Combine as:
 
 ```
-teach = max(teach_full * plays_min, refresh)
+teach = max(teach_full * teach_factor, refresh)
 ```
 
 The ladder covers partial knowledge; the refresh term covers "everyone knows it, but it's
-been months". Never both at once.
+been months". Take the larger, never the sum. An attendee with 0 plays has no
+`days_since_last_play`; skip them for the refresh term — the novelty ladder already sets the
+teach floor.
 
 **Scaling with table size** — more people means more side questions:
 
@@ -200,11 +208,11 @@ capped at 0.60
 effective_play = playing_time * (1 + slowdown)
 ```
 
-**`novelty_sum` uses that same familiarity ladder** — summed across attendees, since every
+**`novelty_sum` uses that same novelty ladder** — summed across attendees, since every
 novice at the table contributes:
 
 ```
-novelty_sum = Σ familiarity(attendee, game)      // §4.2.1, range 0..n
+novelty_sum = Σ novelty(attendee, game)      // §4.2.1, range 0..n
 ```
 
 Fractional sums mean a rusty veteran costs less than a total newcomer, and the exponential
@@ -234,6 +242,7 @@ Worked examples:
 | TI4, 4p, all new | 240 | +56% | 374 |
 
 Cap at +60% so a pathological composition can't produce a 6-hour slot for a 2-hour game.
+Missing weight uses the same 2.5 assumption as teach.
 
 **Every consumer must use `effective_play`, not `playing_time`:**
 
@@ -262,6 +271,8 @@ Two things not to conflate:
 
 - **M1/M2, no play history**: default to **full teach**. Conservative — an overrun ruins a
   plan, an extra 10 minutes of slack doesn't. Mark it low-confidence in the "why" breakdown.
+  M1 uses a flat estimate (`playing_time + full teach + 3 min setup`); M2 replaces it with
+  the weight/length formula and the slowdown model.
 - **M2 interim**: a `knows` set per game (tick which members have played it on the shelf).
   Ten minutes of tapping for a 20–40 game shelf, and it immediately gives the
   learn-vs-warm split without any logging.
@@ -273,7 +284,9 @@ Two things not to conflate:
 
 Teach is computed for who is present **at slot start**. Someone arriving at 8:30 misses the
 Concordia teach — flag it on the slot: *"Dan arrives 8:30, needs a catch-up"* and add ~5 min,
-or reorder the plan so the teach happens when everyone is there.
+or reorder the plan so the teach happens when everyone is there. Slowdown uses the wider set
+of attendees present at any point during the slot; teach uses only the slot-start set. A late
+arrival still slows turns without paying for a teach they missed.
 
 ### 4.3 Scoring
 
@@ -330,11 +343,11 @@ Slot index determines role: first slot = lightest/opener, last = short/closer, m
 
 ```
 6:00pm  Dinner / arrive                                                      40m
-6:40    Opener   Just One       20 play, warm                    +3 setup     23m
-7:03    Main 1   Concordia     121 play (+21%, 1 new)  +20 teach  +3 setup    143m
+6:40    Opener   Just One       20 play, warm                  +3 overhead     23m
+7:03    Main 1   Concordia     121 play (+21%, 1 new)  +22 overhead (20 teach / 3 setup)  143m
 9:26    Break                                                                15m
-9:41    Main 2   Orleans        90 play  +2 refresh (7wks)        +3 setup     94m
-11:15   Closer   The Crew       23 play (+17%, 1 new)  +7 teach   +3 setup     32m
+9:41    Main 2   Orleans        90 play  +4 overhead (2 refresh / 3 setup, 7wks)   94m
+11:15   Closer   The Crew       23 play (+17%, 1 new)  +9 overhead (7 teach / 3 setup)    32m
 11:47   ends — 13 min slack before midnight
 ```
 
@@ -348,8 +361,12 @@ The same engine with `total = 90` produces one slot. One engine, two entry point
 ```
 dp[t][k] = best total score using k games in t minutes
 item contribution = base_score(game) + shape_fit(game, k)
-                    - penalties(duplicate, recently played, veto, mechanic repeat)
+                    - plan_penalties(duplicate, mechanic repeat)
 ```
+
+`base_score` is the §4.3 score, including `played_recently` and the `-∞` veto, so those must
+not be charged again here. `duplicate` is `-∞` (never the same game twice); `mechanic repeat`
+starts at `-0.5` and is tuned with play data.
 
 - O(slots × minutes × games). 360 × 8 × 200 ≈ 576k transitions. Instant.
 - Time is always **`est_minutes`** (§4.2), never raw `playingtime` — including the teach,
@@ -377,7 +394,7 @@ Never silently drop options.
 Poll options are frozen plan snapshots. Single-game polls are 1-slot plans rendered as game cards.
 
 ```
-ballots.ranking jsonb   // ["option_c", "option_a"] in preference order, [] = abstain
+ballots.ranking jsonb   // [3, 1] in preference order, [] = abstain (poll_option ids)
 ```
 
 Count server-side only. The client must never receive rankings before close.
@@ -446,9 +463,11 @@ A persistent control in the bottom action bar — not a toast that expires:
 
 **Draft persistence**
 
-Every ballot change writes server-side with `submitted_at = null`, so a refresh, a dead
-battery, or switching phones loses nothing. Only rows with `submitted_at IS NOT NULL` count
-toward "4 of 6 ballots in" — nobody sees a half-finished ballot.
+Every ballot change is written server-side immediately, so a refresh, a dead battery, or
+switching phones loses nothing. A row is a draft (`submitted_at IS NULL`) until the first
+submit; only submitted rows count toward "4 of 6 ballots in", so nobody sees a half-finished
+ballot. Editing an already-submitted ballot keeps `submitted_at` set — it stays in the count.
+There is no implicit unsubmit; a submitted ballot stays submitted while it is edited.
 
 A submitted ballot stays editable until close, so undo is scoped to the editor, not the record.
 
@@ -459,12 +478,14 @@ a refresh or a dropped connection loses nothing.
 
 ### 4.9 Reveal
 
-Round-by-round bars, eliminations in red, transfer arrows, revealed one step at a time.
-For plan-level polls, include the slot diff between finalists:
+Round-by-round bars, eliminations in red with a strike label, transfer arrows, revealed one
+step at a time. For plan-level polls, include the slot diff between finalists:
 
-> Round 2 — Compact 4 · Varied 3
-> Varied eliminated; ballots transferred to Compact (2) and Party (1)
-> **Winner: Compact** — swaps Orleans for Cascadia at 9:20
+> Round 1 — Compact 3 · Varied 3 · Party-ish 2
+> Party-ish eliminated; ballots transfer to Compact (1) and Varied (1)
+> Round 2 — Compact 4 · Varied 4 → tie
+> Eliminate the lower planner score; Compact survives
+> **Winner: Compact** — swaps Orleans for Cascadia at 9:41
 
 This is the only screen people screenshot. Give it real design time; the tally is already computed.
 
@@ -472,7 +493,8 @@ This is the only screen people screenshot. Give it real design time; the tally i
 
 `draft → polling → chosen → in progress → logged`
 
-Store a timestamp per transition. Night-of edits operate on a **copy** of the chosen plan's
+Store `sessions.state_changed_at` on every transition; add a `session_events` table only if
+the full history is ever shown. Night-of edits operate on a **copy** of the chosen plan's
 slots so the poll history and reveal never mutate.
 
 ---
@@ -506,7 +528,7 @@ M2 adds the planner view (timeline with editable slots) between `/tonight` and `
   server-side drafts. Not repeated here, so there's one place to change it.
 - **No accounts for the vote** is not an option anymore, but the invite link must be one tap.
 - **Participation, not preferences, while open.** Show `4 of 6 ballots in` and who hasn't voted.
-- **Host is the bottle-neck** → default `closes_at` = now + 15 min, host can close early or extend.
+- **Host is the bottleneck** → default `closes_at` = now + 15 min, host can close early or extend.
 - QR code rendered **server-side** (`skip2/go-qrcode`) from `APP_URL`, so the encoded host can
   never drift from the link the group was sent.
 
@@ -516,7 +538,7 @@ M2 adds the planner view (timeline with editable slots) between `/tonight` and `
 
 ```sql
 -- identity
-users(id, name, email_nullable, created_at)
+users(id, name, created_at)
 groups(id, name, created_at)
 memberships(group_id, user_id, role, created_at)
 invites(id, group_id, user_id, token_hash, expires_at, used_at)
@@ -532,12 +554,15 @@ games(
   weight numeric(3,2),
   image_url, categories text[], mechanics text[],
   teach_override_min int null,
-  source enum('bgg','manual'), updated_at
+  setup_override_min int null,
+  source text check (source in ('bgg','manual')), updated_at
 )
 
 -- ownership
-copies(id, game_id, owner_id, status, lent_to, lent_since, location)
+copies(id, game_id, owner_id, status, lent_to references users(id), lent_since, location)
 -- status: owned | lent | previously_owned
+-- lent_to is a user, so a game lent to Sam appears in Sam's list. Deleting that user is
+-- RESTRICTed while the loan is open, and status = 'lent' requires lent_to to be set.
 
 vetoes(user_id, game_id, created_at, PRIMARY KEY (user_id, game_id))
 
@@ -546,12 +571,12 @@ ratings(group_id, game_id, user_id, score numeric(4,1), updated_at,
 -- 1..10. group_rating = mean(score); absent ratings contribute nothing (0)
 
 -- who has played what (M2 manual "knows" set; M3 derived from plays)
-knows(user_id, game_id, source enum('manual','played'), created_at,
+knows(user_id, game_id, source text check (source in ('manual','played')), created_at,
       PRIMARY KEY (user_id, game_id))
 
 -- sessions and plans
 sessions(id, group_id, start_at, total_minutes, headcount, state,
-         chosen_plan_id, created_at)
+         state_changed_at, chosen_plan_id, created_at)
 attendees(session_id, user_id, from_time, to_time)
 
 plans(id, session_id, preset, score, rationale jsonb, created_at)
@@ -568,24 +593,31 @@ ballots(id, poll_id, user_id, ranking jsonb, submitted_at, updated_at)
 -- ranking = []           = explicitly abstained
 
 -- history (M3, create now with nullable fields)
-plays(id, group_id, game_id, copy_id, played_on, duration_min,
+plays(id, group_id, game_id, copy_id, played_on, duration_min int null,
       teach_minutes int null, new_players int, notes, created_by)
 play_players(play_id, user_id, guest_name, position, score, winner)
 ```
 
 Notes:
 
-- `int[]` for player-count sets on Postgres; `pgx` reads and writes them natively (`[]int32`).
-  No join table needed.
+- `int[]` for player-count sets on Postgres; `pgx` reads and writes them natively and `sqlc`
+  maps them to `[]int32`. No join table needed.
 - Indexes: `games(bgg_id)`, `slots(plan_id, position)`, `ballots(poll_id, user_id)`,
-  `copies(game_id)`, `plays(group_id, played_on)`, `auth_sessions(token_hash)`,
+  `copies(game_id)`, `copies(lent_to)`, `plays(group_id, played_on)`, `auth_sessions(token_hash)`,
   `invites(token_hash)`.
 - Both token tables store a **sha256 hash** of 32 bytes from `crypto/rand`; the raw value exists
   only in the link or the cookie.
-- `group_id` on everything from day one: a column now, a migration later.
+- `group_id` on every group-owned table from day one (`memberships`, `invites`, `ratings`,
+  `sessions`, `plays`). Per-user tables (`vetoes`, `knows`) stay global preferences, and
+  `copies` are scoped by `owner_id`; add `group_id` to those only if a user can span groups.
+  A column now, a migration later.
 - Create `slots`, `plans`, `knows`, `plays.duration_min`, `plays.teach_minutes`,
   `plays.new_players` and `games.teach_override_min` in M1 even though one-slot plans are
-  all you make.
+  all you make. `games.setup_override_min` arrives with the setup model in M2.
+- `0001_initial.sql` covers identity + catalogue. The session/plan/poll tables (`sessions`,
+  `attendees`, `plans`, `slots`, `polls`, `poll_options`, `ballots`) plus the early-created
+  `knows`, `plays` and `play_players` arrive in a follow-up `0002_*.sql` before the first
+  `/tonight` session.
 - Measured durations are bucketed for lookup as `(game, player_count, new_players > 0)` —
   that's the key the slowdown model (§4.2.2) is replaced by once a bucket has 2+ samples.
 
@@ -637,11 +669,13 @@ Fallback if a device is lost: host reissues a token.
 ## 10. Stack
 
 - **Go, standard library first.** `net/http` routing (1.22 method + wildcard patterns) and
-  `html/template` for server-rendered pages. No web framework, no codegen step.
+  `html/template` for server-rendered pages. No web framework.
 - **`htmx`** (vendored, ~14KB) for fragment swaps and 3s poll polling. No client framework,
   no Node, no hydration — plus the ~100 lines of ballot JS described in §4.8.
-- **`pgx/v5`** with hand-written SQL. Queries live next to the handler that uses them; `int[]`
-  and `text[]` scan straight into Go slices. No ORM, no query generator.
+- **`pgx/v5`** for the pool and runtime. `int[]` and `text[]` scan straight into Go slices.
+- **`sqlc`** generates typed pgx code from `internal/database/queries/*.sql`, using the goose
+  migrations as its schema. Generated code is committed and never hand-edited; `make check`
+  runs `sqlc diff` so it can't drift. The planner/IRV/teach maths stays ordinary Go, not SQL.
 - **Tailwind** via the standalone CLI at image-build time; the output is embedded with
   `go:embed`, so the binary serves its own CSS and static files.
 - **Postgres on Supabase** (free tier) — database only, **not** Supabase Auth.
@@ -650,21 +684,24 @@ Fallback if a device is lost: host reissues a token.
   parallel identity system that the token flow already replaces.
 - QR generated **server-side** (`skip2/go-qrcode`) so the poll URL is never assembled in the
   browser and can't drift from `APP_URL`.
-- **`goose`** migrations with a committed `migrations/` folder, run against the **direct**
+- **`goose`** migrations in `internal/database/migrations/`, run against the **direct**
   connection (5432) — never from an app request.
 
-Dependency budget: `pgx`, `go-qrcode`, htmx, and `testcontainers-go` for tests. Everything else
-is the standard library.
+Dependency budget: `pgx`, `go-qrcode`, htmx, `godotenv` (local env loading), `sqlc` (build-time
+only), and `testcontainers-go` for tests. Everything else is the standard library.
 
 ```
-cmd/server/main.go          flags, pool, routes, graceful shutdown
-internal/auth/              invite + session tokens, CSRF, middleware
-internal/db/                pool setup, small query helpers
-internal/games/             shelf, copies, lending, vetoes
-internal/bgg/               adapter interface + XML client
-internal/planner/           pure functions: score, IRV, fillSlots, teach, slowdown
-internal/web/               handlers + templates/*.html + static/
-migrations/                 numbered .sql files, applied by goose
+main.go                       flags, pool, routes, graceful shutdown
+internal/auth/                invite + session tokens, CSRF, middleware
+internal/database/            pool setup, migrations/*.sql, queries/*.sql, db/ (sqlc output)
+internal/games/               shelf, copies, lending, vetoes
+internal/bgg/                 adapter interface + XML client
+internal/planner/             pure functions: score, IRV, fillSlots, teach, slowdown
+internal/httpserver/          handlers + middleware
+internal/httpx/               response helpers
+internal/templates/           template renderer
+web/templates/                HTML templates
+web/public/                   static assets
 ```
 
 **Deliberately not used** — each of these adds a layer between the code and the behaviour a
@@ -675,8 +712,12 @@ reviewer has to trust:
 | TypeScript / Next.js | Two languages and a framework for an app that is mostly forms |
 | `templ` | Code generation: generated `_templ.go` files are another thing to audit; plain `.html` is readable by anyone |
 | `chi` | `net/http` has method + wildcard routing since 1.22 |
-| `sqlc` / an ORM | Generated or magic query layers hide the actual SQL; hand-written `pgx` queries are longer but auditable |
+| An ORM (GORM, Ent) | Hides the actual SQL behind structs and query builders; sqlc keeps `queries/*.sql` as the source of truth |
 | Django / FastAPI | Django is fastest to build but least inspectable; FastAPI rebuilds auth, CSRF and admin by hand anyway |
+
+`sqlc` is the one generator kept, and only because its output is mechanical: the input is plain
+SQL you can read, and the generated code is field-by-field scanning with no hidden behaviour.
+`templ` was rejected because it *replaces* the template source with a generated Go program.
 
 Fallback for self-hosting later: the same binary in Docker against any Postgres, optionally
 behind a reverse proxy with TLS. Keep auth and BGG access behind thin interfaces so the swap
@@ -704,7 +745,8 @@ every 3s for 15 minutes (~1,800 requests a night) — so no limits are close.
 | Billing | A billing account is required even at $0; set a **$1 budget alert** |
 
 The server listens on `0.0.0.0:$PORT` (Cloud Run injects `PORT`) and shuts down gracefully on
-`SIGTERM`; Cloud Run health-checks both. A Go cold start is ~1–2s, so the "waking up the shelf"
+`SIGTERM`. Cloud Run doesn't health-check by default; add startup/liveness probes only if the
+service needs them. A Go cold start is ~1–2s, so the "waking up the shelf"
 loading state a Node/serverless stack would need is not worth building.
 
 ### Cost
@@ -728,7 +770,7 @@ Every deploy creates a revision. Roll back by shifting traffic to the previous r
 ### Environment variables
 
 ```
-DATABASE_URL        pooled, port 6543
+DATABASE_URL        pooled, port 6543 in production; direct 5432 locally
 DIRECT_URL          direct, port 5432 — local/CI only; never set on the Cloud Run service
 AUTH_SECRET         32+ random bytes
 APP_URL             https://<service>-<hash>.run.app   ← single source for every generated link
@@ -828,10 +870,12 @@ working; only `APP_URL` changes, and everything generated from it follows automa
 The code is written with AI assistance and reviewed by someone who reads Go but won't audit
 every line. These rules are what make review possible:
 
-- **`make check` is the gate**: `gofmt -l .`, `go vet ./...`, `go test ./...`, `go build ./...`.
-  Nothing is "done" until all four are green.
-- **Schema changes arrive only as a new numbered file in `migrations/`.** A diff that changes
-  database shape without a new migration is a bug, full stop.
+- **`make check` is the gate**: `gofmt -l .`, `go vet ./...`, `sqlc diff`, `go test ./...`,
+  `go build ./...`. Nothing is "done" until all five are green.
+- **Schema changes arrive only as a new numbered file in `internal/database/migrations/`.**
+  A diff that changes database shape without a new migration is a bug, full stop.
+- **`internal/database/db/` is generated.** Change `queries/*.sql` or the schema, run `make
+  generate`, and commit the result. Never hand-edit generated files; `sqlc diff` catches drift.
 - **One file, one job.** A file that no longer fits on a screen is a signal to split it, not to
   scroll. The layout in §10 is the map.
 - **The hand-checked behaviours** are the ones that ruin a night: an invite link works once and
@@ -851,7 +895,7 @@ every line. These rules are what make review possible:
 - `teach_override_min` set → formula ignored entirely
 - Three new players in a 2-hour game → +31% play time, plan still ends on time
 - All-new table on a heavy game → slowdown capped at +60%, no absurd slot
-- 4-player game where one attendee is rusty (≥180d) → half-novelty, not full teach
+- 4-player game where one attendee is rusty (≥180d) → 30% novelty, not full teach
 - Measured bucket `(game, players, new_players>0)` exists → median wins over the formula
 - Someone arrives mid-game and misses the teach → slowdown still counts them, teach doesn't
 - Headcount changes after the poll opens → mark plans stale, offer regenerate
@@ -897,7 +941,7 @@ every line. These rules are what make review possible:
 **M2**
 
 7. Slot model, teach model (§4.2.1) + slowdown model (§4.2.2) + setup overlap,
-   projected end time
+   projected end time — replaces M1's flat `playing_time + full teach + 3` estimate
 8. Preset shapes + DP filler (budgeting on `est_minutes`)
 9. `knows` set on the shelf for real teach and slowdown estimates
 10. Editable slots: swap / lock / insert / remove, live warnings
